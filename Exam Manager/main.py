@@ -1,0 +1,1459 @@
+import asyncio
+import disnake
+from disnake.ext import tasks, commands
+from disnake.ext.commands import is_owner, NotOwner
+from datetime import timedelta
+import db_helpers
+from helpers import *
+from monitor import UniversalMonitor
+import os
+import os.path
+from conf import *
+import traceback
+
+intents = disnake.Intents.default()
+intents.members = True
+intents.guilds = True
+intents.message_content = True
+bot = commands.InteractionBot(intents=intents, test_guilds=approved_guilds)
+monitor = UniversalMonitor(bot, bot_name, webhook_url)
+
+async def get_roblox_id(user):
+    try:
+        async with aiohttp.ClientSession() as session:
+                async with session.post(
+                    "https://users.roblox.com/v1/usernames/users",
+                    json={"usernames": [user], "excludeBannedUsers": False},
+                    timeout=15
+                    ) as response:
+                        if response.status == 200:
+                            data = await response.json()
+                            users = data.get("data", [])
+                            if users:
+                                return users[0]["id"]  # returns first match
+                            else:
+                                print(f"No user found for: {user}")
+                                return None
+                        else:
+                            print(f"Failed: {response.status}\nget_roblox_id")
+                            return None
+
+    except Exception as e:
+        await monitor.report_warn(f"Error fetching Discord ID for {user}: {e}", "get_roblox_id")
+        return None
+
+async def get_member_id(user, search_guild_id):
+    '''Takes a roblox username and finds the discord id via bloxlink'''
+
+    roblox_id = await get_roblox_id(user)
+    if not roblox_id:
+        return None
+
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get(
+            f'https://api.blox.link/v4/public/guilds/{search_guild_id}/roblox-to-discord/{roblox_id}',
+            headers={"Authorization": bloxlink_api},
+            timeout=10
+                ) as response:
+                if response.status != 200:
+                    await monitor.report_warn(f"Bloxlink returned {response.status} for {user}", "get_member_id")
+                    return None
+
+                discord_data = await response.json()
+
+        try:
+            return discord_data["discordIDs"][0]
+        except KeyError:
+            await monitor.report_warn(
+                f"Key Error on {user}. Roblox ID {roblox_id}\nDiscord data: {discord_data}",
+                "get_member_id"
+            )
+            return None
+
+    except Exception as e:
+        await monitor.report_warn(f"Error fetching Discord ID for {user}: {e}", "get_member_id")
+        return None
+
+def instructor_tracking(inter: disnake.Interaction):
+    with open("instructor_tracking.json", "r") as f:
+        instruct = json.load(f)
+
+    try:
+        instructor = instruct[inter.user.display_name]
+        instructor += 1
+
+    except KeyError:
+        data = {inter.user.display_name: 1}
+
+        with open("instructor_tracking.json", "w") as f:
+            json.dump(data, f, indent=2)
+
+async def get_cadet(sheet_id, guild, user, sheet ):
+    try:
+        return await guild.fetch_member(int(sheet_id))
+
+    except (disnake.NotFound, disnake.HTTPException, ValueError):
+        temp_id = await get_member_id(user, guild.id)
+        if temp_id:
+            try:
+                return await guild.fetch_member(temp_id)
+            except (disnake.NotFound, disnake.HTTPException) as e:
+                await monitor.report_warn(f"Cannot fetch member {user}: {e}",
+                                          f"get_cadet_{sheet}")
+                return None
+        else:
+            await monitor.report_warn(
+                f"No Discord ID found for {user}",
+                f"get_cadet_{sheet}"
+            )
+            return None
+
+async def get_cadet_no_id(guild, user, sheet):
+
+    temp_id = await get_member_id(user, guild.id)
+    if temp_id:
+        try:
+            return await guild.fetch_member(temp_id)
+        except (disnake.NotFound, disnake.HTTPException) as e:
+            await monitor.report_warn(f"Cannot fetch member {user}: {e}",
+                                      f"get_cadet_{sheet}")
+            return None
+    else:
+        await monitor.report_warn(
+            f"No Discord ID found for {user}",
+            f"get_cadet_{sheet}"
+        )
+        return None
+
+class PostReviewView(disnake.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @disnake.ui.button(label="Approve", style=disnake.ButtonStyle.success, custom_id="post_approve")
+    async def approve(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+
+        review_data = await db_helpers.get_pending_review(interaction.message.id)
+        if not review_data:
+            await interaction.response.send_message(
+                "Review data not found.", ephemeral=True)
+            return
+
+        user_id = review_data[0]["userid"]
+
+        increment_instructor_count(
+            interaction.user.id,
+            interaction.user.display_name,
+            "post"
+        )
+
+        for item in self.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.green()
+        embed.title = "Approved"
+        embed.add_field(
+            name="Decision",
+            value=f"Approved by {interaction.user.mention}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        member = await interaction.guild.fetch_member(user_id)
+        role = interaction.guild.get_role(post_p1_id)
+        await member.add_roles(role)
+
+        exam_results = interaction.guild.get_channel(exam_results_channel)
+        await interaction.response.send_message("Processing...", ephemeral=True)
+        await exam_results.send(f"Congratulations {member.mention} you have passed POST P1!")
+        await interaction.edit_original_message(content="Complete", delete_after=5)
+
+        await db_helpers.delete_pending_review(interaction.message.id)
+
+    @disnake.ui.button(label="Deny", style=disnake.ButtonStyle.danger, custom_id="post_deny")
+    async def deny(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        review_data = await db_helpers.get_pending_review(interaction.message.id)
+        if not review_data:
+            await interaction.response.send_message(
+                "Review data not found.", ephemeral=True)
+            return
+
+        user_id = review_data[0]["userid"]
+
+        increment_instructor_count(
+            interaction.user.id,
+            interaction.user.display_name,
+            "post"
+        )
+
+        for item in self.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.red()
+        embed.title = "Denied"
+        embed.add_field(
+            name="Decision",
+            value=f"Denied by {interaction.user.mention}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        user = interaction.client.get_user(user_id)
+        if user:
+            await user.send("You did not pass POST P1.")
+
+        await interaction.response.send_message("Exam Denied.", ephemeral=True, delete_after=10)
+
+        await db_helpers.delete_pending_review(interaction.message.id)
+
+    @disnake.ui.button(label="Deny w/ Reason", style=disnake.ButtonStyle.secondary, custom_id="post_denyreason")
+    async def deny_reason(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        await interaction.response.send_modal(
+            PostDenyReasonModal(self)
+        )
+
+class PostDenyReasonModal(disnake.ui.Modal):
+    def __init__(self, view: PostReviewView):
+        components = [
+            disnake.ui.TextInput(
+                label="Reason",
+                custom_id="deny_reason",
+                style=disnake.TextInputStyle.paragraph,
+                required=True,
+                max_length=500,
+            )
+        ]
+
+        super().__init__(
+            title="Deny Exam",
+            components=components,
+        )
+
+        self.view = view
+
+    async def callback(self, interaction: disnake.ModalInteraction):
+        reason = interaction.text_values["deny_reason"]
+
+        for item in self.view.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.red()
+        embed.title = "Exam Denied"
+        embed.add_field(
+            name="Decision",
+            value=f"Denied by {interaction.user.mention}\n**Reason:** {reason}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self.view)
+
+        user = interaction.client.get_user(self.view.user_id)
+        if user:
+            try:
+                await user.send(
+                    f"Your Exam POST P1 was denied.\n**Reason:** {reason}"
+                )
+            except Exception:
+                pass
+
+        await interaction.response.send_message(
+            "Exam denied with reason.",
+            ephemeral=True,
+            delete_after=10
+        )
+
+
+class SceneReviewView(disnake.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @disnake.ui.button(label="Approve", style=disnake.ButtonStyle.success, custom_id="scene_approve")
+    async def approve(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        review_data = await db_helpers.get_pending_review(interaction.message.id)
+        if not review_data:
+            await interaction.response.send_message("Review data not found.", ephemeral=True)
+            return
+
+        user_id = review_data[0]["userid"]
+
+        increment_instructor_count(
+            interaction.user.id,
+            interaction.user.display_name,
+            "scene"
+        )
+
+        for item in self.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.green()
+        embed.title = "Approved"
+        embed.add_field(
+            name="Decision",
+            value=f"Approved by {interaction.user.mention}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        member = await interaction.guild.fetch_member(user_id)
+        if not member.get_role(car_bl) and not member.get_role(sc_bl):
+            role = interaction.guild.get_role(scene_p1_id)
+            await member.add_roles(role)
+
+            exam_results = interaction.guild.get_channel(exam_results_channel)
+            await interaction.response.send_message("Processing...", ephemeral=True)
+            await exam_results.send(f"Congratulations {member.mention} you have passed Scene Command P1!")
+            await interaction.edit_original_message(content="Complete", delete_after=5)
+
+        await db_helpers.delete_pending_review(interaction.message.id)
+
+    @disnake.ui.button(label="Deny", style=disnake.ButtonStyle.danger, custom_id="scene_deny")
+    async def deny(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        review_data = await db_helpers.get_pending_review(interaction.message.id)
+        if not review_data:
+            await interaction.response.send_message("Review data not found.", ephemeral=True)
+            return
+
+        user_id = review_data[0]["userid"]
+
+        increment_instructor_count(
+            interaction.user.id,
+            interaction.user.display_name,
+            "scene"
+        )
+
+        for item in self.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.red()
+        embed.title = "Denied"
+        embed.add_field(
+            name="Decision",
+            value=f"Denied by {interaction.user.mention}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        user = interaction.client.get_user(user_id)
+        if user:
+            await user.send("You did not pass Scene Command P1.")
+
+        await interaction.response.send_message("Exam Denied.", ephemeral=True, delete_after=10)
+        await db_helpers.delete_pending_review(interaction.message.id)
+
+    @disnake.ui.button(label="Deny w/ Reason", style=disnake.ButtonStyle.secondary, custom_id="scene_denyreason")
+    async def deny_reason(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        await interaction.response.send_modal(
+            SceneDenyReasonModal(self)
+        )
+
+class SceneDenyReasonModal(disnake.ui.Modal):
+    def __init__(self, view: SceneReviewView):
+        components = [
+            disnake.ui.TextInput(
+                label="Reason",
+                custom_id="deny_reason",
+                style=disnake.TextInputStyle.paragraph,
+                required=True,
+                max_length=500,
+            )
+        ]
+
+        super().__init__(
+            title="Deny Exam",
+            components=components,
+        )
+
+        self.view = view
+
+    async def callback(self, interaction: disnake.ModalInteraction):
+        reason = interaction.text_values["deny_reason"]
+
+        for item in self.view.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.red()
+        embed.title = "Exam Denied"
+        embed.add_field(
+            name="Decision",
+            value=f"Denied by {interaction.user.mention}\n**Reason:** {reason}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self.view)
+
+        user = interaction.client.get_user(self.view.user_id)
+        if user:
+            try:
+                await user.send(
+                    f"Your Exam Scene Command P1 was denied.\n**Reason:** {reason}"
+                )
+            except Exception:
+                pass
+
+        await interaction.response.send_message(
+            "Exam denied with reason.",
+            ephemeral=True,
+            delete_after=10
+        )
+
+
+class AviationReviewView(disnake.ui.View):
+    def __init__(self):
+        super().__init__(timeout=None)
+
+    @disnake.ui.button(label="Approve", style=disnake.ButtonStyle.success, custom_id="aviation_approve")
+    async def approve(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        review_data = await db_helpers.get_pending_review(interaction.message.id)
+        if not review_data:
+            await interaction.response.send_message("Review data not found.", ephemeral=True)
+            return
+
+        user_id = review_data[0]["userid"]
+
+        increment_instructor_count(
+            interaction.user.id,
+            interaction.user.display_name,
+            "aviation"
+        )
+
+        for item in self.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.green()
+        embed.title = "Approved"
+        embed.add_field(
+            name="Decision",
+            value=f"Approved by {interaction.user.mention}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        member = await interaction.guild.fetch_member(user_id)
+        if not member.get_role(car_bl) and not member.get_role(heli_bl) and not member.get_role(plane_bl):
+            role = interaction.guild.get_role(aviation_id)
+            await member.add_roles(role)
+
+            exam_results = interaction.guild.get_channel(exam_results_channel)
+            await interaction.response.send_message("Processing...", ephemeral=True)
+            await exam_results.send(f"Congratulations {member.mention} you have passed Aviation P1!")
+            await interaction.edit_original_message(content="Complete", delete_after=5)
+
+        await db_helpers.delete_pending_review(interaction.message.id)
+
+    @disnake.ui.button(label="Deny", style=disnake.ButtonStyle.danger, custom_id="aviation_deny")
+    async def deny(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        review_data = await db_helpers.get_pending_review(interaction.message.id)
+        if not review_data:
+            await interaction.response.send_message("Review data not found.", ephemeral=True)
+            return
+
+        user_id = review_data[0]["userid"]
+
+        increment_instructor_count(
+            interaction.user.id,
+            interaction.user.display_name,
+            "aviation"
+        )
+
+        for item in self.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.red()
+        embed.title = "Denied"
+        embed.add_field(
+            name="Decision",
+            value=f"Denied by {interaction.user.mention}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self)
+
+        user = interaction.client.get_user(user_id)
+        if user:
+            await user.send("You did not pass Aviation P1.")
+
+        await interaction.response.send_message("Exam Denied.", ephemeral=True, delete_after=10)
+        await db_helpers.delete_pending_review(interaction.message.id)
+
+    @disnake.ui.button(label="Deny w/ Reason", style=disnake.ButtonStyle.secondary, custom_id="aviation_deny_reason")
+    async def deny_reason(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        await interaction.response.send_modal(
+            AviationDenyReasonModal(self)
+        )
+
+class AviationDenyReasonModal(disnake.ui.Modal):
+    def __init__(self, view: AviationReviewView):
+        components = [
+            disnake.ui.TextInput(
+                label="Reason",
+                custom_id="deny_reason",
+                style=disnake.TextInputStyle.paragraph,
+                required=True,
+                max_length=500,
+            )
+        ]
+
+        super().__init__(
+            title="Deny Exam",
+            components=components,
+        )
+
+        self.view = view
+
+    async def callback(self, interaction: disnake.ModalInteraction):
+        reason = interaction.text_values["deny_reason"]
+
+        for item in self.view.children:
+            item.disabled = True
+
+        embed = interaction.message.embeds[0]
+        embed.color = disnake.Color.red()
+        embed.title = "Exam Denied"
+        embed.add_field(
+            name="Decision",
+            value=f"Denied by {interaction.user.mention}\n**Reason:** {reason}",
+            inline=False
+        )
+
+        await interaction.message.edit(embed=embed, view=self.view)
+
+        user = interaction.client.get_user(self.view.user_id)
+        if user:
+            try:
+                await user.send(
+                    f"Your Exam Aviation P1 was denied.\n**Reason:** {reason}"
+                )
+            except Exception:
+                pass
+
+        await interaction.response.send_message(
+            "Exam denied with reason.",
+            ephemeral=True,
+            delete_after=10
+        )
+
+class CertReportView(disnake.ui.View):
+    def __init__(self, pages: list[str], title: str):
+        super().__init__(timeout=120)
+        self.pages = pages
+        self.index = 0
+        self.title = title
+
+    def make_embed(self):
+        embed = disnake.Embed(
+            title=self.title,
+            description=self.pages[self.index],
+            color=disnake.Color.gold()
+        )
+        embed.set_footer(text=f"Page {self.index + 1} / {len(self.pages)}")
+        return embed
+
+    @disnake.ui.button(label="Prev", style=disnake.ButtonStyle.secondary)
+    async def prev(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        if self.index > 0:
+            self.index -= 1
+            await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+    @disnake.ui.button(label="Next", style=disnake.ButtonStyle.secondary)
+    async def next(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        if self.index < len(self.pages) - 1:
+            self.index += 1
+            await interaction.response.edit_message(embed=self.make_embed(), view=self)
+        else:
+            await interaction.response.defer()
+
+@bot.slash_command(name="instructor_report", description="[STAFF] View instructor approval statistics")
+async def instructor_report(inter: disnake.ApplicationCommandInteraction):
+    await inter.response.defer()
+
+    if not is_role(rma_employee, inter.user):
+        return await inter.edit_original_response(
+            "You have insufficient permissions to use this command."
+        )
+
+    tracking = get_instructor_stats()
+
+    if not tracking:
+        await inter.edit_original_response("No instructor data recorded yet.")
+        return
+
+    sorted_instructors = sorted(
+        tracking.items(),
+        key=lambda x: x[1]["total"],
+        reverse=True
+    )
+
+    embed = disnake.Embed(
+        title="Instructor Exam Statistics",
+        description="Total Exams Reviewed per instructor",
+        color=disnake.Color.blue()
+    )
+
+    for instructor_id, data in sorted_instructors:
+        instructor_name = data["name"]
+        total = data["total"]
+        post = data["post"]
+        scene = data["scene"]
+        aviation = data["aviation"]
+
+        field_value = (
+            f"**Total:** {total}\n"
+            f"POST: {post} | Scene: {scene} | Aviation: {aviation}"
+        )
+
+        embed.add_field(
+            name=f"{instructor_name}",
+            value=field_value,
+            inline=False
+        )
+
+    embed.set_footer(text=f"Total Instructors: {len(tracking)}")
+    await inter.edit_original_response(embed=embed)
+
+
+@bot.slash_command(name="my_reviews", description="[STAFF] View your approval statistics")
+async def my_reviews(inter: disnake.ApplicationCommandInteraction):
+
+    await inter.response.defer(ephemeral=True)
+
+    if not is_role(rma_employee, inter.user):
+        return await inter.edit_original_response(
+            "You have insufficient permissions to use this command."
+        )
+    stats = get_instructor_stats(inter.user.id)
+    if not stats:
+        await inter.edit_original_response(
+            "You haven't approved any exams yet."
+        )
+        return
+
+    embed = disnake.Embed(
+        title=f"Your Approval Statistics",
+        description=f"Instructor: {inter.user.display_name}",
+        color=disnake.Color.blue()
+    )
+    embed.add_field(name="Total Approvals", value=str(stats["total"]), inline=False)
+    embed.add_field(name="POST P1", value=str(stats["post"]), inline=True)
+    embed.add_field(name="Scene P1", value=str(stats["scene"]), inline=True)
+    embed.add_field(name="Aviation P1", value=str(stats["aviation"]), inline=True)
+
+    await inter.edit_original_response(embed=embed)
+
+
+@bot.slash_command(name="reset_instructor_tracking", description="[Division Lead] Reset all instructor tracking data")
+async def reset_tracking(inter: disnake.ApplicationCommandInteraction):
+
+    await inter.response.defer(ephemeral=True)
+
+    if not is_role(dl_role, inter.user):
+        return await inter.edit_original_response(
+            "You have insufficient permissions to use this command."
+        )
+
+    await inter.response.defer(ephemeral=True)
+
+    view = ConfirmResetView()
+    await inter.edit_original_response(
+        ":warning: Are you sure you want to reset ALL instructor tracking data? This cannot be undone!",
+        view=view
+    )
+
+@bot.slash_command(name="examcheck", description="Checks a Users exam results")
+async def examcheck(inter: disnake.ApplicationCommandInteraction,
+                    user : disnake.Member = commands.Param(description="User to view exam"),
+                    exam = commands.Param(description="Exam to view results",
+                                          choices=[
+                                              "POST P1",
+                                              "Scene Command P1",
+                                              "Aviation P1",
+                                              "POST Final",
+                                              "Scene Command Final"
+                                          ]),
+                    search_type = commands.Param(description="Search by discord id or Roblox Username",
+                                                 choices=["Discord ID", "Roblox Username"])):
+
+
+    await inter.response.defer(ephemeral=True)
+
+    if not is_role(rma_employee, inter.user):
+
+        await monitor.report_warn("examcheck", f"User: {inter.user.display_name} tried to run examcheck without permissions")
+
+        return await inter.edit_original_response(
+            "You have insufficient permissions to use this command."
+        )
+
+    user_name = user.display_name
+    discord_id = str(user.id)
+    data = None
+
+    if search_type == "Discord ID":
+        if exam == "POST P1":
+            data = await db_helpers.read_exams(discord_id, "postp1exams", search_type)
+        elif exam == "Scene Command P1":
+            data = await db_helpers.read_exams(discord_id, "scenep1exam", search_type)
+        elif exam == "Aviation P1":
+            data = await db_helpers.read_exams(discord_id, "aviationp1exam", search_type)
+        elif exam == "POST Final":
+            data = await db_helpers.read_exams(discord_id, "postp4exams", search_type)
+        elif exam == "Scene Command Final":
+            data = await db_helpers.read_exams(discord_id, "scenefinalexam", search_type)
+
+    else:
+        if exam == "POST P1":
+            data = await db_helpers.read_exams(user_name, "postp1exams", search_type)
+        elif exam == "Scene Command P1":
+            data = await db_helpers.read_exams(user_name, "scenep1exam", search_type)
+        elif exam == "Aviation P1":
+            data = await db_helpers.read_exams(user_name, "aviationp1exam", search_type)
+        elif exam == "POST Final":
+            data = await db_helpers.read_exams(user_name, "postp4exams", search_type)
+        elif exam == "Scene Command Final":
+            data = await db_helpers.read_exams(user_name, "scenefinalexam", search_type)
+
+    if data:
+        for row in data:
+            embed = disnake.Embed(
+                title = f"Exam Stats for {user_name}"
+            )
+            embed.add_field(name="Roblox Username", value=row['robloxusername'])
+            embed.add_field(name="Score", value=row['score'])
+            embed.add_field(name="Discord User Id", value=row['discordid'])
+            embed.add_field(name="Timestamp", value=row['timestamp'])
+            embed.add_field(name="Exam Type", value=exam)
+
+            channel = inter.channel
+            await channel.send(embed=embed)
+
+        await inter.edit_original_response(f"All Exams sent for {user_name}")
+
+    else:
+        await inter.edit_original_response(f"No Exams on record for {user_name} : {user.id}")
+
+@bot.slash_command(name="discord_id", description="Display the discord id for the user running the command.")
+async def discord_id(inter: disnake.ApplicationCommandInteraction):
+
+    await inter.response.defer(ephemeral=True)
+    await inter.edit_original_response(f"Display Name: {inter.user.display_name}\nDiscord Id: {inter.user.id}\n")
+    return
+
+
+
+class ConfirmResetView(disnake.ui.View):
+    def __init__(self):
+        super().__init__(timeout=60)
+
+    @disnake.ui.button(label="Confirm Reset", style=disnake.ButtonStyle.danger)
+    async def confirm(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        reset_instructor_tracking()
+
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="Instructor tracking data has been reset.",
+            view=self
+        )
+
+    @disnake.ui.button(label="Cancel", style=disnake.ButtonStyle.secondary)
+    async def cancel(self, button: disnake.ui.Button, interaction: disnake.Interaction):
+        for item in self.children:
+            item.disabled = True
+
+        await interaction.response.edit_message(
+            content="Reset cancelled.",
+            view=self
+        )
+
+@bot.slash_command(name="certification_report", description="[STAFF] Runs a report to check certification statuses")
+async def cert_report(inter: disnake.ApplicationCommandInteraction):
+
+    await inter.response.defer()
+
+    if not is_role(rma_employee, inter.user):
+        return await inter.edit_original_response(
+            "You have insufficient permissions to use this command."
+        )
+
+    sheet_data = read_sheet("Certification List", car_db_sheet)
+    headers = sheet_data[13]
+
+    guild = bot.get_guild(guild_id)
+    #guild = bot.get_guild(1470528441349701780)
+
+    if not guild:
+        await monitor.report_error(Exception("Guild not found"), context="cert_report")
+        return
+
+    reported_certs = list()
+
+    display_names = {member.display_name for member in guild.members}
+
+    for row in sheet_data[14::]:
+        records = dict(zip(headers, row))
+
+        member_name = records.get("Username")
+        post_cert_db = records.get("POST")
+        instructor = records.get("INSTRUCTOR")
+        heli = records.get("HELI PILOT")
+        scene = records.get("SCENE CMD")
+        plane = records.get("PLANE PILOT")
+
+        if not member_name:
+            continue
+
+        if member_name not in display_names:
+            reported_certs.append(f"**{member_name}** - Not found in RMA Server.\n")
+
+        try:
+            for member in guild.members:
+
+                if member.display_name == member_name:
+                    certs = []
+
+                    roles = member.roles
+                    heli_check = cert_validator(heli, heli_cert, roles)
+                    post_check = cert_validator(post_cert_db, post_cert, roles)
+                    plane_check = cert_validator(plane, plane_cert, roles)
+                    instructor_check = cert_validator(instructor, instructor_role, roles)
+                    scene_check = cert_validator(scene, scene_role, roles)
+
+                    if not heli_check[0]:
+                        certs.append(f"Certification: Heli Pilot\n{heli_check[1]}")
+                    if not post_check[0]:
+                        certs.append(f"Certification: POST\n{post_check[1]}")
+                    if not plane_check[0]:
+                        certs.append(f"Certification: Plane Pilot\n{plane_check[1]}")
+                    if not instructor_check[0]:
+                        certs.append(f"Certification: Instructor\n{instructor_check[1]}")
+                    if not scene_check[0]:
+                        certs.append(f"Certification: Scene Command\n{scene_check[1]}")
+
+                    if certs:
+                        certs_review = ", ".join(certs)
+                        reported_certs.append(f"**{member_name}** - {certs_review}\n")
+                    #reported_certs[member_name] = certs
+
+        except Exception as e:
+            continue
+
+    if reported_certs:
+
+        page_size = 10
+
+        pages = [
+            "\n".join(reported_certs[i:i + page_size])
+            for i in range(0, len(reported_certs), page_size)
+        ]
+        title = "RMA User Certification Report"
+
+        view  = CertReportView(pages, title)
+
+        await inter.edit_original_response(embed=view.make_embed(), view=view)
+
+    else:
+        await inter.edit_original_response("None Found, not good. something busted")
+
+@tasks.loop(seconds=poll_time)
+async def poll_sheet_post_p1():
+    dm_logs = bot.get_channel(1483829387202658526)
+    post_logging = bot.get_channel(1483284646606409885)
+
+    guild = bot.get_guild(guild_id)
+
+    try:
+        data = await db_helpers.post_insert()
+        if data:
+            for db_hash in data:
+                rows_by_hash = await db_helpers.search_for_hash(db_hash, "postp1exams")
+
+                user = rows_by_hash[0]["robloxusername"]
+                user_score = rows_by_hash[0]['score']
+                long_form = rows_by_hash[0]['longform']
+                disc_id = rows_by_hash[0]['discordid']
+                stats_link = rows_by_hash[0]['statslink']
+                final_score = int(user_score.split("/")[0].strip())
+
+                if disc_id:
+                    member = await get_cadet(disc_id, guild, user, "post_p1")
+                else:
+                    await monitor.report_warn(f"No sheet_disc_id for {user}", "poll_sheet_post_p1")
+                    member = None
+
+                if final_score >= post_p1_score:
+                    if member:
+                        try:
+                            if member.get_role(car_bl) or member.get_role(post_bl):
+                                try:
+                                    await member.send(
+                                        "Your exam cannot be graded until your POST Blacklist is removed. See support for more details.")
+                                except disnake.Forbidden:
+                                    await monitor.report_warn(f"Cannot DM blacklisted user {member.id}",
+                                                              "poll_sheet_post_p1")
+
+                        except Exception as e:
+                            await monitor.report_error(e, context="POST BL Check")
+                            continue
+
+                    embed = disnake.Embed(
+                        title=f"POST P1 Exam - {user}",
+                        color=disnake.Color.blurple()
+                    )
+
+                    if member:
+                        embed.add_field(name="User", value=member.mention, inline=True)
+                    else:
+                        embed.add_field(name="User", value=f":warning: No Discord ID found for {user} - Manual review required",
+                                        inline=True)
+
+                    embed.add_field(name="Score", value=user_score, inline=True)
+                    #embed.add_field(name="Long Form Response", value=long_form, inline=True)
+                    add_field_safe(embed, name="Long Form Response", value=long_form, inline=True)
+                    embed.add_field(name="User Statistics", value=f"[View Stats Image]({stats_link})", inline=False)
+                    embed.set_footer(text="RMA Manager - Developed by bat_nation0224")
+
+                    message = await post_logging.send(embed=embed, view=PostReviewView())
+                    await db_helpers.exampending_insert(exam_type="post",
+                                                        user_id=disc_id,
+                                                        score=user_score,
+                                                        longform=long_form,
+                                                        stats=stats_link,
+                                                        msg_id=message.id)
+
+                elif final_score < 50:
+                    if not member:
+                        await monitor.report_warn(f"Cannot notify {user} of failed exam - no Discord member found",
+                                                  "poll_sheet_post_p1")
+                        await dm_logs.send(
+                            f"User {user} did not pass POST P1.\nUser had a score of {user_score}\nUser was not notified, unable to notify user.")
+                        continue
+                    try:
+                        await member.send(f"You did not pass POST P1. Your score was {user_score}")
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass POST P1.\nUser had a score of {user_score}")
+                    except disnake.Forbidden:
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass POST P1 (DM failed).\nUser had a score of {user_score}")
+
+        else:
+            now = datetime.now()
+            next_run = timedelta(minutes=10)
+            run_time = (now + next_run).strftime("%I:%M:%S %p")
+            print(f"POST P1 Runs again on {run_time}")
+            return
+
+    except Exception as e:
+        await monitor.report_error(e, context=f"poll_sheet_post_p1")
+
+@tasks.loop(seconds=poll_time)
+async def poll_post_final():
+    dm_logs = bot.get_channel(1483829387202658526)
+    guild = bot.get_guild(guild_id)
+    post_role = guild.get_role(post_role_id)
+    p3_role = guild.get_role(post_p3_role_id)
+
+    try:
+        data = await db_helpers.post_final_insert()
+        if data:
+            for db_hash in data:
+                rows_by_hash = await db_helpers.search_for_hash(db_hash, "postp4exams")
+                user = rows_by_hash[0]["robloxusername"]
+                user_score = rows_by_hash[0]['score']
+                final_score = int(user_score.split("/")[0].strip())
+                member = await get_cadet_no_id(guild, user, "postp4-Finals")
+
+                if member:
+                    if not member.get_role(post_p3_role_id):
+                        await dm_logs.send(f"User {member.name} has taken the POST final exam without the P3 Role.")
+                        continue
+
+                if final_score >= 22:
+                    if member:
+                        try:
+                            if member.get_role(car_bl) or member.get_role(post_bl):
+                                try:
+                                    await member.send(
+                                        "Your exam cannot be graded until your Scene Blacklist is removed. See support for details.")
+                                except disnake.Forbidden:
+                                    await monitor.report_warn(f"Cannot DM blacklisted user {member.id}",
+                                                              "poll_post_final")
+                                continue
+                        except Exception as e:
+                            await monitor.report_error(e, context="Scene BL Check")
+                            continue
+
+                        exam_results = bot.get_channel(exam_results_channel)
+                        try:
+                            await member.add_roles(post_role)
+                            await member.remove_roles(p3_role)
+                            await exam_results.send(f"Congratulations {member.mention} you have passed POST Phase 4!")
+
+                            db_access_role = guild.get_role(1316468909595033741)
+                            database_request_msg = (f"{db_access_role.mention}\n"
+                                                    f"Username: {member.mention}\n"
+                                                    f"Certifications to add: POST Certification\n"
+                                                    f"Notes: Auto-graded, POST Passed with {user_score}")
+
+                            database_request_channel = guild.get_channel(database_request_id)
+                            await database_request_channel.send(database_request_msg)
+
+                        except Exception as e:
+                            await monitor.report_error(e, context="Post final role updates")
+
+                    else:
+                        embed = disnake.Embed(
+                            color= disnake.Color.yellow(),
+                            title=f"POST Final Exam Unable to find {user}",
+                            description=f"Unable to find user {user}, manual role update and database request needed. User had a score of {user_score}"
+                        )
+                        final_exams_channel = guild.get_channel(final_exams_channel_id)
+                        await final_exams_channel.send(embed=embed)
+
+                elif final_score < 22:
+                    if not member:
+                        await monitor.report_warn(f"Cannot notify {user} of failed exam - no Discord member found",
+                                                  "poll_post_final")
+                        await dm_logs.send(
+                            f"User {user} did not pass POST Final Exam.\nUser had a score of {user_score}\nUser was not notified, unable to notify user.")
+                        continue
+
+                    try:
+                        await member.send(f"You did not pass the POST Final Exam. Your score was {user_score}")
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass POST Final Exam.\nUser had a score of {user_score}")
+                    except disnake.Forbidden:
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass POST Final Exam (DM failed).\nUser had a score of {user_score}")
+
+        else:
+            now = datetime.now()
+            next_run = timedelta(minutes=10)
+            run_time = (now + next_run).strftime("%I:%M:%S %p")
+            print(f"POST Final Runs again on {run_time}")
+            return
+
+    except Exception as e:
+        await monitor.report_error(e, context=f"poll_post_final")
+
+@tasks.loop(seconds=poll_time)
+async def poll_sheet_scene_p1():
+    dm_logs = bot.get_channel(1483829387202658526)
+    scene_logging = bot.get_channel(1483284709072044102)
+    guild = bot.get_guild(guild_id)
+
+    try:
+        data = await db_helpers.scene_insert()
+        if data:
+            for db_hash in data:
+                rows_by_hash = await db_helpers.search_for_hash(db_hash, "scenep1exam")
+
+                user = rows_by_hash[0]["robloxusername"]
+                user_score = rows_by_hash[0]['score']
+                long_form = rows_by_hash[0]['longform']
+                disc_id = rows_by_hash[0]['discordid']
+                stats_link = rows_by_hash[0]['statslink']
+                final_score = int(user_score.split("/")[0].strip())
+
+                if disc_id:
+                    member = await get_cadet(disc_id, guild, user, "scene")
+                else:
+                    await monitor.report_warn(f"No sheet_disc_id for {user}", "poll_sheet_scene_p1")
+                    member = None
+
+                if final_score >= 26:
+                    if member:
+                        try:
+                            if member.get_role(car_bl) or member.get_role(sc_bl):
+                                try:
+                                    await member.send(
+                                        "Your exam cannot be graded until your Scene Blacklist is removed. See support for details.")
+                                except disnake.Forbidden:
+                                    await monitor.report_warn(f"Cannot DM blacklisted user {member.id}",
+                                                              "poll_sheet_scene_p1")
+                                continue
+                        except Exception as e:
+                            await monitor.report_error(e, context="Scene BL Check")
+                            continue
+
+                    embed = disnake.Embed(
+                        title=f"Scene P1 Exam - {user}",
+                        color=disnake.Color.blurple()
+                    )
+
+                    if member:
+                        embed.add_field(name="User", value=member.mention, inline=True)
+                    else:
+                        embed.add_field(name="User", value=f"No Discord ID found for {user} - Manual review required",
+                                        inline=True)
+
+                    embed.add_field(name="Score", value=user_score, inline=True)
+                    # embed.add_field(name="Long Form Response", value=long_form, inline=True)
+                    add_field_safe(embed, name="Long Form Response", value=long_form, inline=True)
+                    embed.add_field(name="User Statistics", value=f"[View Stats Image]({stats_link})", inline=False)
+                    embed.set_footer(text="RMA Manager - Developed by bat_nation0224")
+
+                    message = await scene_logging.send(embed=embed, view=SceneReviewView())
+                    await db_helpers.exampending_insert(exam_type="scene",
+                                                        user_id=disc_id,
+                                                        score=user_score,
+                                                        longform=long_form,
+                                                        stats=stats_link,
+                                                        msg_id=message.id)
+
+                elif final_score < 26:
+                    if not member:
+                        await monitor.report_warn(f"Cannot notify {user} of failed exam - no Discord member found",
+                                                  "poll_sheet_scene_p1")
+                        await dm_logs.send(
+                            f"User {user} did not pass Scene Command P1.\nUser had a score of {user_score}\nUser was not notified, unable to notify user.")
+                        continue
+                    try:
+                        await member.send(f"You did not pass Scene Command P1. Your score was {user_score}")
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass Scene Command P1.\nUser had a score of {user_score}")
+                    except disnake.Forbidden:
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass Scene Command P1 (DM failed).\nUser had a score of {user_score}")
+
+        else:
+            now = datetime.now()
+            next_run = timedelta(minutes=10)
+            run_time = (now + next_run).strftime("%I:%M:%S %p")
+            print(f"Scene Command P1 Runs again on {run_time}")
+            return
+
+    except Exception as e:
+        await monitor.report_error(e, context=f"poll_sheet_scene_p1")
+
+@tasks.loop(seconds=poll_time)
+async def poll_scene_final():
+    dm_logs = bot.get_channel(1483829387202658526)
+    guild = bot.get_guild(guild_id)
+
+    scene_role = guild.get_role(scene_role_id)
+    scene_p2_role = guild.get_role(scene_p2_role_id)
+
+    try:
+        data = await db_helpers.scene_final_insert()
+        if data:
+            for db_hash in data:
+                rows_by_hash = await db_helpers.search_for_hash(db_hash, "scenefinalexam")
+                user = rows_by_hash[0]["robloxusername"]
+                user_score = rows_by_hash[0]['score']
+                final_score = int(user_score.split("/")[0].strip())
+                member = await get_cadet_no_id(guild, user, "Scene-Finals")
+
+                if member:
+                    if not member.get_role(scene_p2_role_id):
+                        await dm_logs.send(f"User {member.name} has taken the Scene Command final exam without the P2 Role.")
+                        continue
+
+                if final_score >= 22:
+                    if member:
+                        try:
+                            if member.get_role(car_bl) or member.get_role(sc_bl):
+                                try:
+                                    await member.send(
+                                        "Your exam cannot be graded until your Scene Blacklist is removed. See support for details.")
+                                except disnake.Forbidden:
+                                    await monitor.report_warn(f"Cannot DM blacklisted user {member.id}",
+                                                              "poll_scene_final")
+                                continue
+                        except Exception as e:
+                            await monitor.report_error(e, context="Scene BL Check")
+                            continue
+
+                        exam_results = bot.get_channel(exam_results_channel)
+                        try:
+                            await member.add_roles(scene_role)
+                            await member.remove_roles(scene_p2_role)
+                            await exam_results.send(f"Congratulations {member.mention} you have passed the Scene Command Final Exam!")
+
+                            db_access_role = guild.get_role(1316468909595033741)
+                            database_request_msg = (f"{db_access_role.mention}\n"
+                                                    f"Username: {member.mention} - {user}\n"
+                                                    f"Certifications to add: Scene Command Certification\n"
+                                                    f"Notes: Auto-graded, Scene Command Passed with {user_score}")
+                            database_request_channel = guild.get_channel(database_request_id)
+                            await database_request_channel.send(database_request_msg)
+
+                        except Exception as e:
+                            await monitor.report_error(e, context="Scene Command final role updates")
+
+                    else:
+                        embed = disnake.Embed(
+                            color= disnake.Color.yellow(),
+                            title=f"Scene Command Final Exam Unable to find {user}",
+                            description=f"Unable to find user {user}, manual role update and database request needed. User had a score of {user_score}"
+                        )
+                        final_exams_channel = guild.get_channel(final_exams_channel_id)
+                        await final_exams_channel.send(embed=embed)
+
+                elif final_score < 22:
+                    if not member:
+                        await monitor.report_warn(f"Cannot notify {user} of failed exam - no Discord member found",
+                                                  "poll_scene_final")
+                        await dm_logs.send(
+                            f"User {user} did not pass Scene Command Final Exam.\nUser had a score of {user_score}\nUser was not notified, unable to notify user.")
+                        continue
+
+                    try:
+                        await member.send(f"You did not pass the Scene Command Final Exam. Your score was {user_score}")
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass Scene Command Final Exam.\nUser had a score of {user_score}")
+                    except disnake.Forbidden:
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass Scene Command Final Exam (DM failed).\nUser had a score of {user_score}")
+
+        else:
+            now = datetime.now()
+            next_run = timedelta(minutes=10)
+            run_time = (now + next_run).strftime("%I:%M:%S %p")
+            print(f"Scene Command Final Runs again on {run_time}")
+            return
+
+    except Exception as e:
+        await monitor.report_error(e, context=f"poll_scene_final")
+
+@tasks.loop(seconds=poll_time)
+async def poll_sheet_aviation():
+    guild = bot.get_guild(guild_id)
+    aviation_logging = bot.get_channel(1483284745034141736)
+    dm_logs = bot.get_channel(1483829387202658526)
+
+    try:
+        data = await db_helpers.aviation_insert()
+        if data:
+            for db_hash in data:
+                rows_by_hash = await db_helpers.search_for_hash(db_hash, "aviationp1exam")
+
+                user = rows_by_hash[0]["robloxusername"]
+                user_score = rows_by_hash[0]['score']
+                long_form = rows_by_hash[0]['longform']
+                disc_id = rows_by_hash[0]['discordid']
+                stats_link = rows_by_hash[0]['statslink']
+                final_score = int(user_score.split("/")[0].strip())
+
+                if disc_id:
+                    member = await get_cadet(disc_id, guild, user, "aviation")
+                else:
+                    await monitor.report_warn(f"No sheet_disc_id for {user}", "poll_sheet_aviation")
+                    member = None
+
+                if final_score >= 16:
+                    if member:
+                        try:
+                            if member.get_role(car_bl) or member.get_role(heli_bl) or member.get_role(plane_bl):
+                                try:
+                                    await member.send(
+                                        "Your exam cannot be graded until your Aviation blacklists are removed. See support for details.")
+                                except disnake.Forbidden:
+                                    await monitor.report_warn(f"Cannot DM blacklisted user {member.id}",
+                                                              "poll_sheet_aviation")
+                                continue
+
+                        except Exception as e:
+                            await monitor.report_error(e, context="Aviation BL Check")
+                            continue
+
+                    embed = disnake.Embed(
+                        title=f"Aviation P1 Exam - {user}",
+                        color=disnake.Color.blurple()
+                    )
+
+                    if member:
+                        embed.add_field(name="User", value=member.mention, inline=True)
+                    else:
+                        embed.add_field(name="User", value=f"No Discord ID found for {user} - Manual review required",
+                                        inline=True)
+
+                    embed.add_field(name="Score", value=user_score, inline=True)
+                    # embed.add_field(name="Long Form Response", value=long_form, inline=True)
+                    add_field_safe(embed, name="Long Form Response", value=long_form, inline=True)
+                    embed.add_field(name="User Statistics", value=f"[View Stats Image]({stats_link})", inline=False)
+                    embed.set_footer(text="RMA Manager - Developed by bat_nation0224")
+
+                    view_user_id = disc_id if disc_id else 0
+                    message = await aviation_logging.send(embed=embed, view=AviationReviewView())
+                    await db_helpers.exampending_insert(exam_type="aviation",
+                                                        user_id=disc_id,
+                                                        score=user_score,
+                                                        longform=long_form,
+                                                        stats=stats_link,
+                                                        msg_id=message.id)
+
+                elif final_score < 16:
+                    if not member:
+                        await monitor.report_warn(f"Cannot notify {user} of failed exam - no Discord member found",
+                                                  "poll_sheet_aviation")
+                        await dm_logs.send(
+                            f"User {user} did not pass Aviation P1.\nUser had a score of {user_score}\nUser was not notified, unable to notify user.")
+                        continue
+
+                    try:
+                        await member.send(f"You did not pass Aviation P1. Your score was {user_score}")
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass Aviation P1.\nUser had a score of {user_score}")
+                    except disnake.Forbidden:
+                        await dm_logs.send(
+                            f"User {member.mention} did not pass Aviation P1 (DM failed).\nUser had a score of {user_score}")
+
+        else:
+            now = datetime.now()
+            next_run = timedelta(minutes=10)
+            run_time = (now + next_run).strftime("%I:%M:%S %p")
+            print(f"Aviation P1 Runs again on {run_time}")
+            return
+
+    except Exception as e:
+        await monitor.report_error(e, context=f"poll_sheet_aviation")
+
+@tasks.loop(hours=24)
+async def auto_role_task():
+
+    rma_server = bot.get_guild(guild_id)
+    prot_server = bot.get_guild(prot_guild_id)
+
+    prot_role = prot_server.get_role(protection_officer_id)
+    sc_members = rma_server.get_role(scene_role).members
+    prot_server_members = prot_server.members
+
+    try:
+        for member in prot_server_members:
+            member_roles = member.roles
+
+            if prot_role not in member_roles:
+                if member in sc_members:
+                    await member.add_roles(prot_role)
+    except Exception as e:
+        await monitor.report_error("Auto Role Task", f"{e}")
+
+@bot.event
+async def on_member_join(member):
+
+    prot_server = bot.get_guild(prot_guild_id)
+    prot_role = prot_server.get_role(protection_officer_id)
+
+    try:
+        await member.add_roles(prot_role)
+    except Exception as e:
+        await monitor.report_error("Join Auto Role", context=f"{e}")
+
+#@tasks.loop(hours=24)
+
+#commented out until further testing is complete.
+
+# @bot.slash_command(name="testing_command")
+# @is_owner()
+# async def guardian_check(inter: disnake.ApplicationCommandInteraction):
+#     await inter.response.defer(ephemeral=True)
+#
+#     guild = bot.get_guild(guild_id)
+#     members = guild.members
+#     for member in members:
+#         member_id = member.id
+#         member_display = member.display_name
+#         member_username = member.name
+#         member_roles = str(member.roles)
+#         await db_helpers.member_insert(member_id, member_username, member_display, member_roles)
+#
+#     await inter.edit_original_response("Success")
+
+@bot.slash_command(name="guild_check", description="Joined Guild details")
+@is_owner()
+async def guild_check(interaction: disnake.ApplicationCommandInteraction):
+    joined_guilds = bot.guilds
+    for guild in joined_guilds:
+        await monitor.guild_report(guild)
+
+@bot.slash_command(name="remove")
+@is_owner()
+async def remove(interaction: disnake.ApplicationCommandInteraction, guild_id):
+    await interaction.response.defer(ephemeral=True)
+
+    guild = bot.get_guild(int(guild_id))
+
+    if guild is None:
+        await interaction.followup.send("Error in guild id")
+
+    guild_name = guild.name
+    await guild.leave()
+    await interaction.followup.send(f"Left {guild_name}", ephemeral=True)
+
+@bot.event
+async def on_ready():
+    print(f"Logged in as {bot.user}")
+
+    bot.add_view(PostReviewView())
+    bot.add_view(SceneReviewView())
+    bot.add_view(AviationReviewView())
+
+    if not poll_sheet_post_p1.is_running():
+        poll_sheet_post_p1.start()
+    if not poll_sheet_scene_p1.is_running():
+        poll_sheet_scene_p1.start()
+    if not poll_sheet_aviation.is_running():
+        poll_sheet_aviation.start()
+    if not poll_post_final.is_running():
+        poll_post_final.start()
+    if not poll_scene_final.is_running():
+        poll_scene_final.start()
+    if not auto_role_task.is_running():
+        auto_role_task.start()
+
+    if os.path.exists(flag_path):
+        await monitor.report_restart()
+
+    with open(flag_path, "w") as f:
+        f.write("running")
+    await monitor.report_online()
+    bot.loop.create_task(monitor.heartbeat())
+
+@bot.event
+async def on_button_click(inter: disnake.MessageInteraction):
+    """Track button clicks"""
+    monitor.track_request()
+    await monitor.check_rate_limit()
+
+@bot.event
+async def on_message_command(inter: disnake.MessageCommandInteraction):
+    """Track message commands"""
+    monitor.command_count += 1
+    monitor.track_request()
+    await monitor.check_rate_limit()
+
+@bot.event
+async def on_error(event, *args, **kwargs):
+    await monitor.report_error(Exception(traceback.format_exc()))
+
+@bot.event
+async def on_slash_command_error(inter: disnake.ApplicationCommandInteraction, error):
+    if isinstance(error, NotOwner):
+        ran_by = inter.user.display_name
+        await inter.send(":x: You don't have permissions to use this command.")
+        if inter.guild.name:
+            await monitor.report_warn(f"User: {ran_by} tried to run this command in {inter.guild.name}",
+            context=f"/{inter.application_command.name}")
+        else:
+            await monitor.report_warn(f"User: {ran_by} tried to run this command.",
+            context=f"/{inter.application_command.name}")
+    else:
+        await monitor.report_error(error, context=f"/{inter.application_command.name}")
+
+if __name__ == "__main__":
+    bot.run(BOT_TOKEN)
